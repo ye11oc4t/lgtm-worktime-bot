@@ -13,6 +13,7 @@ Discord 슬래시 명령으로 출근, 퇴근, 휴식과 날짜별 실작업시�
 | `/잔디 [사용자] [월]` | 지정 사용자의 월간 작업시간을 GitHub식 잔디로 표시합니다. 월 형식은 `YYYY-MM`입니다. |
 | `/셋로그 내용` 또는 `/setlog content` | 현재 한 시간 구간에 하고 있는 일을 저장합니다. 같은 시간에 다시 입력하면 수정됩니다. |
 | `/today [사용자]` | 오늘 작성한 시간대별 업무 내용과 근무시간을 표시합니다. |
+| `/스크럼` | 오늘의 `/today` 기록을 확인하고 상세 일일 업무보고를 작성·검토한 뒤 Discord 스크럼 채널과 Slack에 전송합니다. |
 
 시간대 기본값은 `Asia/Seoul`이며 데이터는 서버별·사용자별로 분리됩니다. 같은 날에는 한 번의 근무 기록만 생성할 수 있습니다. 봇이나 Railway 컨테이너가 재시작되어도 PostgreSQL 기록은 유지됩니다.
 
@@ -29,6 +30,30 @@ Discord 슬래시 명령으로 출근, 퇴근, 휴식과 날짜별 실작업시�
 ```
 
 같은 시간에 다시 입력하면 기존 내용이 수정됩니다. `/today`는 작성한 업무 로그를 시간순으로 보여주며 `사용자` 옵션으로 다른 구성원의 기록도 조회할 수 있습니다.
+
+## 일일 스크럼 업무보고
+
+`/스크럼`은 `SCRUM_CHANNEL_ID`로 지정한 별도 스크럼 채널에서만 작동합니다. 실행하면 본인에게만 오늘의 `/today` 시간대별 로그와 근무시간이 표시되고, `일일 업무보고 작성` 버튼이 나타납니다.
+
+작성 모달은 다음 5개 항목으로 구성됩니다.
+
+1. 담당 모듈 / 작업 영역
+2. 완료한 일
+3. 진행 중인 일
+4. 다음에 할 일
+5. 어려웠던 점 / 비고사항
+
+모달 제출은 초안 저장일 뿐이며 외부로 전송되지 않습니다. 비공개 최종 미리보기에서 `완성 및 Slack 전송` 버튼을 눌러야 스크럼 채널과 Slack에 동시에 공유됩니다. 같은 날짜의 초안은 다시 열어 수정할 수 있지만, 완성된 보고서는 중복 전송과 사후 변경을 막기 위해 잠깁니다.
+
+외부 공유 전 다음 안전장치가 적용됩니다.
+
+- 작성자만 작성·수정·완성 버튼을 사용할 수 있습니다.
+- 전체 멘션, AWS Access Key, Slack·GitHub·Discord 토큰, Slack Webhook, 개인키, 비밀번호·토큰 형태의 값이 감지되면 저장과 전송을 차단합니다.
+- Slack 내용은 `plain_text` 블록으로 보내 사용자 입력에 포함된 멘션이나 서식 명령이 실행되지 않습니다.
+- 전송 상태를 PostgreSQL에 기록해 버튼 중복 클릭과 재시도 시 이중 게시를 방지합니다.
+- Slack 전송에 성공한 뒤 Discord 스크럼 채널에 공개하며, 일부 전송만 성공한 경우 재시도 시 실패한 대상만 처리합니다.
+
+Slack에서는 일일 업무보고를 받을 채널에 Incoming Webhook을 만든 뒤 URL을 Railway의 `SLACK_SCRUM_WEBHOOK_URL`에 비밀 변수로 등록하세요. Webhook URL은 채팅이나 GitHub에 입력하지 않습니다.
 
 ## Discord 봇 만들기
 
@@ -51,7 +76,9 @@ Discord 슬래시 명령으로 출근, 퇴근, 휴식과 날짜별 실작업시�
    DISCORD_TOKEN=<Discord Bot 토큰>
    DATABASE_URL=${{Postgres.DATABASE_URL}}
    TIMEZONE=Asia/Seoul
-   WORK_CHANNEL_ID=<모든 기능을 사용할 Discord 채널 ID>
+   WORK_CHANNEL_ID=<근태 및 시간대별 로그 기능을 사용할 Discord 채널 ID>
+   SCRUM_CHANNEL_ID=<스크럼 업무보고를 작성·게시할 Discord 채널 ID>
+   SLACK_SCRUM_WEBHOOK_URL=<Slack Incoming Webhook URL>
    GUILD_ID=<테스트할 Discord 서버 ID, 선택>
    ```
 
@@ -71,6 +98,8 @@ export DISCORD_TOKEN='...'
 export DATABASE_URL='postgresql://...'
 export TIMEZONE='Asia/Seoul'
 export WORK_CHANNEL_ID='123456789012345678'
+export SCRUM_CHANNEL_ID='234567890123456789'
+export SLACK_SCRUM_WEBHOOK_URL='https://hooks.slack.com/services/...'
 python app.py
 ```
 
@@ -78,7 +107,7 @@ python app.py
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q app.py database.py time_utils.py
+python -m compileall -q app.py database.py scrum_utils.py time_utils.py
 ```
 
 ## 운영상 주의

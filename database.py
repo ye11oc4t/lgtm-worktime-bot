@@ -72,6 +72,24 @@ class Database:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (guild_id, hour_start)
             );
+
+            CREATE TABLE IF NOT EXISTS daily_scrum_reports (
+                id BIGSERIAL PRIMARY KEY,
+                session_id BIGINT NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
+                module TEXT NOT NULL CHECK (char_length(module) BETWEEN 1 AND 300),
+                completed TEXT NOT NULL CHECK (char_length(completed) BETWEEN 1 AND 1000),
+                in_progress TEXT NOT NULL CHECK (char_length(in_progress) BETWEEN 1 AND 1000),
+                next_tasks TEXT NOT NULL CHECK (char_length(next_tasks) BETWEEN 1 AND 1000),
+                blockers_notes TEXT NOT NULL DEFAULT '' CHECK (char_length(blockers_notes) <= 1000),
+                finalized_at TIMESTAMPTZ,
+                publish_started_at TIMESTAMPTZ,
+                discord_message_id BIGINT,
+                slack_published_at TIMESTAMPTZ,
+                publish_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (session_id)
+            );
             """
         )
 
@@ -398,6 +416,206 @@ class Database:
             guild_id,
             user_id,
             work_date,
+        )
+
+    async def get_daily_scrum_report(
+        self,
+        guild_id: int,
+        user_id: int,
+        work_date: date,
+    ) -> asyncpg.Record | None:
+        return await self._pool().fetchrow(
+            """
+            SELECT reports.id, reports.module, reports.completed, reports.in_progress,
+                   reports.next_tasks, reports.blockers_notes, reports.finalized_at,
+                   reports.discord_message_id, reports.slack_published_at,
+                   reports.created_at, reports.updated_at
+            FROM daily_scrum_reports AS reports
+            JOIN work_sessions AS sessions ON sessions.id = reports.session_id
+            WHERE sessions.guild_id = $1 AND sessions.user_id = $2
+              AND sessions.work_date = $3
+            """,
+            guild_id,
+            user_id,
+            work_date,
+        )
+
+    async def upsert_daily_scrum_report(
+        self,
+        guild_id: int,
+        user_id: int,
+        work_date: date,
+        module: str,
+        completed: str,
+        in_progress: str,
+        next_tasks: str,
+        blockers_notes: str,
+    ) -> dict[str, Any]:
+        fields = {
+            "담당 모듈 / 작업 영역": (module, 300, True),
+            "완료한 일": (completed, 1000, True),
+            "진행 중인 일": (in_progress, 1000, True),
+            "다음에 할 일": (next_tasks, 1000, True),
+            "어려웠던 점 / 비고": (blockers_notes, 1000, False),
+        }
+        for label, (value, maximum, required) in fields.items():
+            if required and not value:
+                raise WorktimeError(f"{label}을(를) 입력해 주세요.")
+            if len(value) > maximum:
+                raise WorktimeError(f"{label}은(는) {maximum}자 이내로 입력해 주세요.")
+
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                session = await connection.fetchrow(
+                    """
+                    SELECT id FROM work_sessions
+                    WHERE guild_id = $1 AND user_id = $2 AND work_date = $3
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    user_id,
+                    work_date,
+                )
+                if session is None:
+                    raise WorktimeError(
+                        f"{work_date:%Y-%m-%d} 근무 기록이 없어요. 먼저 `/출근`을 실행해 주세요."
+                    )
+
+                existing = await connection.fetchrow(
+                    """
+                    SELECT id, finalized_at FROM daily_scrum_reports
+                    WHERE session_id = $1 FOR UPDATE
+                    """,
+                    session["id"],
+                )
+                if existing and existing["finalized_at"] is not None:
+                    raise WorktimeError(
+                        "이미 완성하여 공유한 일일 업무보고예요. 중복 전송을 막기 위해 수정할 수 없어요."
+                    )
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO daily_scrum_reports
+                        (session_id, module, completed, in_progress, next_tasks, blockers_notes)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (session_id)
+                    DO UPDATE SET
+                        module = EXCLUDED.module,
+                        completed = EXCLUDED.completed,
+                        in_progress = EXCLUDED.in_progress,
+                        next_tasks = EXCLUDED.next_tasks,
+                        blockers_notes = EXCLUDED.blockers_notes,
+                        updated_at = NOW()
+                    RETURNING module, completed, in_progress, next_tasks,
+                              blockers_notes, created_at, updated_at
+                    """,
+                    session["id"],
+                    module,
+                    completed,
+                    in_progress,
+                    next_tasks,
+                    blockers_notes,
+                )
+                return {**dict(row), "updated": existing is not None}
+
+    async def claim_daily_scrum_publish(
+        self,
+        guild_id: int,
+        user_id: int,
+        work_date: date,
+        expected_updated_at: datetime,
+    ) -> dict[str, Any]:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                report = await connection.fetchrow(
+                    """
+                    SELECT reports.*
+                    FROM daily_scrum_reports AS reports
+                    JOIN work_sessions AS sessions ON sessions.id = reports.session_id
+                    WHERE sessions.guild_id = $1 AND sessions.user_id = $2
+                      AND sessions.work_date = $3
+                    FOR UPDATE OF reports
+                    """,
+                    guild_id,
+                    user_id,
+                    work_date,
+                )
+                if report is None:
+                    raise WorktimeError("먼저 일일 업무보고를 작성해 주세요.")
+
+                already_published = (
+                    report["discord_message_id"] is not None
+                    and report["slack_published_at"] is not None
+                )
+                if already_published:
+                    return {**dict(report), "already_published": True, "busy": False}
+
+                if (
+                    report["publish_started_at"] is not None
+                    and datetime.now(report["publish_started_at"].tzinfo)
+                    - report["publish_started_at"]
+                    < timedelta(minutes=5)
+                ):
+                    return {**dict(report), "already_published": False, "busy": True}
+
+                if report["updated_at"] != expected_updated_at:
+                    raise WorktimeError(
+                        "이 미리보기보다 새로 저장된 초안이 있어요. `/스크럼`에서 최신 내용을 다시 확인해 주세요."
+                    )
+
+                updated = await connection.fetchrow(
+                    """
+                    UPDATE daily_scrum_reports
+                    SET finalized_at = COALESCE(finalized_at, NOW()),
+                        publish_started_at = NOW(), publish_error = NULL
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    report["id"],
+                )
+                return {**dict(updated), "already_published": False, "busy": False}
+
+    async def mark_scrum_slack_published(self, report_id: int) -> None:
+        await self._pool().execute(
+            """
+            UPDATE daily_scrum_reports
+            SET slack_published_at = COALESCE(slack_published_at, NOW())
+            WHERE id = $1
+            """,
+            report_id,
+        )
+
+    async def mark_scrum_discord_published(
+        self, report_id: int, message_id: int
+    ) -> None:
+        await self._pool().execute(
+            """
+            UPDATE daily_scrum_reports
+            SET discord_message_id = COALESCE(discord_message_id, $2)
+            WHERE id = $1
+            """,
+            report_id,
+            message_id,
+        )
+
+    async def finish_scrum_publish(self, report_id: int) -> None:
+        await self._pool().execute(
+            """
+            UPDATE daily_scrum_reports
+            SET publish_started_at = NULL, publish_error = NULL
+            WHERE id = $1
+            """,
+            report_id,
+        )
+
+    async def fail_scrum_publish(self, report_id: int, error: str) -> None:
+        await self._pool().execute(
+            """
+            UPDATE daily_scrum_reports
+            SET publish_started_at = NULL, publish_error = $2
+            WHERE id = $1
+            """,
+            report_id,
+            error[:500],
         )
 
     async def get_active_user_ids(self, guild_id: int) -> list[int]:
